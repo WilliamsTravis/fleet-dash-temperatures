@@ -29,9 +29,13 @@ Created on Tue Dec 31 08:23:24 2019
 @author: twillia2
 """
 import dask.array as da
+import geopandas as gpd
 import h5py as hp
-import json
+import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
+from pygds.utilities import make_pg_connection
+from shapely.geometry import Point
 
 # Make a package?
 from functions import append_zip_tz, day_stats
@@ -48,17 +52,65 @@ time_index = ds["time_index"][:]
 crddf = pd.DataFrame(ds["coordinates"][:])
 temp = da.from_array(ds["air_temperature"], chunks="auto")
 
-# Get the zip codes, coordinates, and time zones 
-meta = append_zip_tz(crddf)
+# Get the zip codes, coordinates, and time zones
+con, cur, engine = make_pg_connection(user="twillia2",
+                                      host='1lv11gispg02.nrel.gov')
+
+# US Zip Code Tabulation Areas in 2017
+query = """select geoid10, the_geom_4326 from twillia2.us_zcta_2017;"""
+zipdf = gpd.read_postgis(query, engine, geom_col="the_geom_4326")
+zipdf = gpd.GeoDataFrame(zipdf, geometry="geometry")
+zipdf["centroid"] = zipdf.geometry.centroid
+zipdf.columns = ["zip", "geometry", "centroid"]
+con.close()
+engine.close()
+meta_original = append_zip_tz(crddf, zipdf)
 
 # Now, subset the temperature data by the new resource index
-resource_index = meta["resource_index"].values
+resource_index = meta_original["resource_index"].values
 resource = temp[:, resource_index]
 
 # Append summary statistics for values between 8 AM and 5 PM, local time
-meta = day_stats(meta=meta, resource=resource, time_index=time_index,
+meta = day_stats(meta=meta_original, resource=resource, time_index=time_index,
                  hour_range=(7, 17))
 ds.close()
+
+# Fill in missing zip codes with neighboring values
+# meta = pd.read_csv("/scratch/twillia2/fleet/final_long.csv")
+meta["zcta"] = meta["zcta"].apply(lambda s: f"{s:05d}")
+meta["centroid"] = meta["centroid"].apply(lambda x: Point(x))
+caught_zips = meta['zcta'].unique()
+all_zips = zipdf['zip'].unique()
+missing_zips = list(set(all_zips).difference(caught_zips))
+mzipdf = zipdf[zipdf["zip"].isin(missing_zips)]
+mzipdf.columns = ["zcta", "geometry", "centroid"]
+mzipdf["lat"] = mzipdf["centroid"].apply(lambda c: c.y)
+mzipdf["lon"] = mzipdf["centroid"].apply(lambda c: c.x)
+mzipdf["utc_zone"] = np.nan
+
+mzipdf = mzipdf[["zcta", "lat", "lon", "centroid", "utc_zone"]]
+meta = gpd.GeoDataFrame(meta, geometry="centroid")
+mzipdf = gpd.GeoDataFrame(mzipdf, geometry="centroid")
+mzipdf = mzipdf.reset_index(drop=True)
+n1 = np.array(list(zip(mzipdf.geometry.x, mzipdf.geometry.y)))
+n2 = np.array(list(zip(meta.geometry.x, mzipdf.geometry.y)))
+btree = cKDTree(n2)
+dist, idx = btree.query(n1, k=1)
+new_values = pd.DataFrame({'distance': dist.astype(int),
+                           'tmin' : meta.loc[idx, "tmin"],
+                           'tmax' : meta.loc[idx, "tmax"],
+                           'tmean' : meta.loc[idx, "tmean"],
+                           'nsrdb_id': meta.loc[idx, "nsrdb_id"]})
+new_values = new_values.reset_index(drop=True)
+newdf = mzipdf.join(new_values)
+newdf = newdf[['zcta', 'nsrdb_id', 'lat', 'lon', 'centroid', 'utc_zone',
+               'tmax', 'tmin', 'tmean']]
+
+# Join these
+meta = pd.concat([meta, newdf])
+
+# We need to get the utc zone from somewhere else!
+
 
 # Group by zip, calculate modes, and clean column names for delivery
 meta = meta.drop("geometry", axis=1)
@@ -70,20 +122,21 @@ meta["tmin_mean"] = group["tmin"].transform("mean")
 meta["tmax_max"] = group["tmax"].transform("max")
 meta["tmin_min"] = group["tmin"].transform("min")
 meta["total_tmean"] = group["tmean"].transform("mean")
-meta.columns = ["zcta", "nsrdb_index", "lat", "lon", "zcta_centroid",
+meta.columns = ["zcta", "nsrdb_id", "lat", "lon", "zcta_centroid",
                 "utc_zone", "tmax", "tmin", "tmean", "tmin_mode", "tmax_mode",
-                "tmax_mean", "tmin_mean", "tmin_min", "tmax_max", "total_tmean"]
+                "tmax_mean", "tmin_mean", "tmin_min", "tmax_max",
+                "total_tmean"]
 meta.to_csv("/scratch/twillia2/fleet/final_long.csv") # Saves everything
 
 # Now just the summary stats
-meta["nsrdb_indices"] = meta.groupby("zcta")["nsrdb_index"].transform(lambda x: str(list(x)))
+meta["nsrdb_ids"] = meta.groupby("zcta")["nsrdb_id"].transform(lambda x: str(list(x)))
 meta2 = meta[['zcta', 'zcta_centroid', 'utc_zone', 'tmin_mode', 'tmax_mode',
               'tmax_mean','tmin_mean', 'tmax_max', 'tmin_min', 'total_tmean',
-              'nsrdb_indices']].drop_duplicates()
-meta2["lon"] = meta2["zcta_centroid"].apply(lambda x: x[0])
-meta2["lat"] = meta2["zcta_centroid"].apply(lambda x: x[1])
+              'nsrdb_ids']].drop_duplicates()
+meta2["lon"] = meta2["zcta_centroid"].apply(lambda x: x.x)
+meta2["lat"] = meta2["zcta_centroid"].apply(lambda x: x.y)
 meta2 = meta2.drop("zcta_centroid", axis=1)
-meta2 = meta2[['zcta', 'lon', 'lat', 'nsrdb_indices', 'utc_zone', 'tmin_mode',
+meta2 = meta2[['zcta', 'lon', 'lat', 'nsrdb_ids', 'utc_zone', 'tmin_mode',
                'tmax_mode', 'tmin_mean', 'tmax_mean', 'tmin_min', 'tmax_max',
                'total_tmean']]
 meta2 = meta2.sort_values("zcta")
@@ -91,7 +144,9 @@ meta2 = meta2.reset_index(drop=True)
 meta2.to_csv("/scratch/twillia2/fleet/final_short.csv")
 
 
-
+meta2['geometry'] = meta2.apply(lambda x: Point(x['lon'], x['lat']), axis=1)
+meta2 = gpd.GeoDataFrame(meta2, geometry="geometry")
+meta2.to_file("/scratch/twillia2/fleet/final.shp")
 # For if we ever manage to get the full timezone-filtered value and time arrays
 # zips = meta["zip"].values
 # zips = np.array([np.string_(x) for x in zips])

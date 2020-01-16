@@ -12,27 +12,16 @@ import h5py
 import numpy as np
 import os
 import pandas as pd
-from pygds.utilities import make_pg_connection
 from shapely.geometry import Point
 from tqdm import tqdm
 from dask.distributed import Client
+from scipy.spatial import cKDTree
 
-
-def append_zip_tz(crddf):
+def append_zip_tz(crddf, zipdf):
     """Take a data frame with coordinates, append US zip codes and time zones
     and return a new data frame.
     """
         
-    # Connect to my new postgres databases!
-    con, cur, engine = make_pg_connection(user="twillia2",
-                                          host='1lv11gispg02.nrel.gov')
-    
-    # US Zip Code Tabulation Areas in 2017
-    print("Reading zip code tabulation area data frame from postgres...")
-    query = """select geoid10, the_geom_4326 from twillia2.us_zcta_2017;"""
-    zipdf = gpd.read_postgis(query, engine, geom_col="the_geom_4326")
-    zipdf.columns = ["zip", "geometry"]
-
     # Filter data geoframe for places within zip codes...
     print("Merging zip codes with resource data coordinates...")
     crddf.columns = ["lat", "lon"]
@@ -40,7 +29,7 @@ def append_zip_tz(crddf):
     crs={"init": "epsg:4326"}
     crddf = gpd.GeoDataFrame(crddf, geometry="geometry", crs=crs)
 
-    # Using points misses quite a few counties, let's use a buffer
+    # Using points misses quite a few counties, let's use a buffer  # <-------- Readjust this, we're using kdtree nearest neighbors
     buffer = crddf.buffer(.02)
     buffer = gpd.GeoDataFrame(buffer)
     buffer["gid"] = buffer.index
@@ -48,19 +37,8 @@ def append_zip_tz(crddf):
     buffer.crs = crs
 
     # Some zip codes will have multiple resource points, taking the first here
-    metadf = gpd.sjoin(zipdf, buffer)
-    metadfo = gpd.sjoin(zipdf, crddf)
-    zipids = metadf[["zip", "index_right"]]
-    zipids.columns = ["zip", "gid"]
-    zipids = zipids.reset_index(drop=True)
-    group = zipids.groupby("zip")
-    zipids["gid"] = group["gid"].transform(lambda x: x.iloc[0])  # take the first?
-    zipids = zipids[["gid", "zip"]].drop_duplicates()
-
-    # Join the resource coordinates back to this data frame
-    metadf2 = pd.merge(zipids, crddf)
-    metadf2 = gpd.GeoDataFrame(metadf2, geometry="geometry")
-
+    metadf = gpd.sjoin(zipdf, crddf)
+   
     # We need to adjust timezones to reflect local times, Working on this
     print("Attaching local time zone adjustments relative to UTC...")
     metadf = time_zones(metadf)
@@ -156,6 +134,13 @@ def when(lst, time_of_day):
     return mode
 
 
+def kdtree(gdf1, gdf2, value_column):
+    """ Perfom a KD-Tree on two geodataframes to fill in missing points
+    from one with values from the other."""
+    # Get a list of coordinate tuples from each data frame
+
+    return df
+
 def local_times(coords, time_index, hour_range=(7, 17)):
     """Return a 2d array of local date times for a set of points between
     8 AM and 5 PM.
@@ -187,6 +172,7 @@ def local_times(coords, time_index, hour_range=(7, 17)):
     ddays = da.from_array(first_days, chunks="auto")
     fddays = da.apply_along_axis(single, 0, ddays, dtype="<M8[ns]")
 
+     # ...
 
 def time_zones(df):
     """Append time zone information to data frame with lat lon"""
